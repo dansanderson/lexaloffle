@@ -2,6 +2,8 @@
 
 This is a miscellaneous collection of code and material related to products by Lexaloffle Games LLP.
 
+This collection is maintained for the benefit of the Lexaloffle community. Source code licenses are indicated below and in the corresponding files, and may differ between files.
+
 ## PICO-8 file format routines
 
 The PICO-8 fantasy game console stores game cartridges in one of several documented file formats. The most canonical file format is the [P8PNG](https://pico-8.fandom.com/wiki/P8PNGFileFormat) format (`.p8.png`), an encoding of the game data stored stegonographically with a PNG image of the game's "cartridge." The Lua code for a cartridge is compressed using one of two documented proprietary methods: the legacy `:c:` method and the newer `pxa` method.
