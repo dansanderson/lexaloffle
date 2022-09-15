@@ -1,10 +1,10 @@
 /*
 	
-	pxa compression snippets for PICO-8 0.2.0 cartridge format
+	pxa compression snippets for PICO-8 cartridge format (as of 0.2.4c)
 
 	author: joseph@lexaloffle.com
 
-	Copyright (c) 2020  Lexaloffle Games LLP
+	Copyright (c) 2020-22  Lexaloffle Games LLP
 
 	Permission is hereby granted, free of charge, to any person obtaining a copy
 	of this software and associated documentation files (the "Software"), to deal
@@ -66,6 +66,21 @@ static int src_pos = 0;
 static uint8 *dest_buf = NULL;
 static uint8 *src_buf = NULL;
 
+// 0.2.0j
+// encode / decode as an int
+static int get_write_pos()
+{
+	int result = (dest_pos << 16) | (byte << 8) | bit;
+	return result;
+}
+static void set_write_pos(int val)
+{
+	bit = val & 0xff;
+	byte = (val >> 8) & 0xff;
+	dest_pos = (val >> 16) & 0x7fff;
+}
+
+
 
 static int getbit()
 {
@@ -81,18 +96,18 @@ static int getbit()
 	return ret;
 }
 
-static void putbit(int bval)
+void putbit(int bval)
 {
-	if (bval) byte |= bit;
+	dest_buf[dest_pos] &= ~bit; // 0.2.0j: per-bit
+	if (bval) dest_buf[dest_pos] |= bit;
 
-	dest_buf[dest_pos] = byte;
 	bit <<= 1;
 
 	if (bit == 256)
 	{
 		bit = 1;
-		byte = 0;
 		dest_pos ++;
+		byte = dest_buf[dest_pos]; // 0.2.0j: so that don't clobber existing bits (can overwrite at bit level)
 	}
 }
 
@@ -208,6 +223,9 @@ static int getnum()
 
 	val = getval(bits);
 
+	if (val == 0 && bits == 10)
+		return -1; // raw block marker
+
 	return val;
 }
 
@@ -228,7 +246,8 @@ static int pxa_find_repeatable_block(uint8 *dat, int pos, int data_len, int *blo
 	int hash;
 	int last_pos;
 	int score, dist, bit_cost, best_score = -1;
-	
+	int list_pos;
+
 	p = &dat[pos];
 
 	// block length can't be longer than remaining
@@ -241,12 +260,18 @@ static int pxa_find_repeatable_block(uint8 *dat, int pos, int data_len, int *blo
 
 	uint16 *list = hash_list[hash];
 
-	for (int list_pos = 0; 
+/*	
+	for (list_pos = 0; 
 			list && list_pos < list[1] && // for each item of list
 			(list[2+list_pos] < pos 
-				&& list[2+list_pos] >= pos - max_hist_len // where starting position in within range
+				&& list[2+list_pos] >= pos - max_hist_len // where starting position in within range   0.2.0e: commented. **wroooong**. don't want to exit iter here.
 			);
 			list_pos++)
+*/
+
+	if (!list) return 0; // 0.2.0e: exit early
+	for (list_pos = 0; list_pos < list[1] && list[2+list_pos] < pos; list_pos++) // 0.2.0e: can exit early if encounter future position (rest of list will also be)
+	if (list[2+list_pos] >= pos - max_hist_len) // not out of range   0.2.0e: moved here -- still want to try rest of list
 	{
 		int pos0 = list[2 + list_pos];
 
@@ -394,9 +419,11 @@ void pxa_build_hash_lookup(uint8 *in, int len)
 		list[2 + list[1]] = i;
 		list[1] ++;
 	}
-
 }
 
+
+#define BACKUP_VLIST_STATE()  memcpy(literal_backup, literal, sizeof(literal));  memcpy(literal_pos_backup, literal_pos, sizeof(literal_pos));
+#define RESTORE_VLIST_STATE() memcpy(literal, literal_backup, sizeof(literal));  memcpy(literal_pos, literal_pos_backup, sizeof(literal_pos));
 
 
 int pxa_compress(uint8 *in_p, uint8 *out, int len)
@@ -411,6 +438,17 @@ int pxa_compress(uint8 *in_p, uint8 *out, int len)
 	int block_score, literal_score;
 	int literal[256];
 	int literal_pos[256];
+	int literal_backup[256];
+	int literal_pos_backup[256];
+
+	// 0.2.0j
+	int raw_pos_src0 = 0;
+	int raw_header_write_pos = 0;
+	int raw_block_write_pos = 0;
+	int raw_pos_src = 0;
+	int raw_pos_dest = 0;
+	int stored_last_segment_as_raw = 0;
+	int raw_block_size = 0;
 	
 
 	init_literals_state(literal, literal_pos);
@@ -448,7 +486,15 @@ int pxa_compress(uint8 *in_p, uint8 *out, int len)
 	num_blocks = 0;
 	num_literals = 0;
 	num_blocks_large = 0;
-	
+
+	// start looking for raw blocks
+	raw_pos_dest = dest_pos;
+	raw_pos_src = raw_pos_src0 = pos;
+	raw_header_write_pos = get_write_pos();
+	raw_block_write_pos = get_write_pos();
+	BACKUP_VLIST_STATE();
+
+
 	while (pos < len)
 	{
 		// either copy or literal
@@ -486,7 +532,8 @@ int pxa_compress(uint8 *in_p, uint8 *out, int len)
 		if (block_len >= PXA_MIN_BLOCK_LEN && block_score > literal_score)
 		if (block_score < 128) // 25% faster, only slight drop in compression ratio (lost avg 3.6 bytes across 5 carts)
 		{
-			for (int ii =1; ii < 3; ii++)
+			int ii;
+			for (ii =1; ii < 3; ii++)
 			{
 				int block_offset2=0;
 				int block_score2=0;
@@ -576,14 +623,78 @@ int pxa_compress(uint8 *in_p, uint8 *out, int len)
 			hash = MINI_HASH(in, i);
 			found[hash] = i;
 		}
+
+		// 0.2.0j: if last 32 bytes (or remaining end of input) written have a ratio worse than ~1.0, rewrite as a raw block instead
+
+		if (dest_pos - raw_pos_dest >= 32 || pos == len)
+		{
+			int compressed_size = dest_pos - raw_pos_dest;
+			int raw_size = pos - raw_pos_src;
+			int margin = raw_pos_src0 == raw_pos_src ? 3 : 0; // 3 for first section (header + null terminator), 0 for appended
+
+			// rewrite as raw block?
+			if (compressed_size > raw_size + margin)
+			{
+				if (stored_last_segment_as_raw == 0) // write header
+				{
+					// write header marker 010 00000 00000
+					raw_block_size = raw_size;
+					raw_header_write_pos = raw_block_write_pos;
+					set_write_pos(raw_header_write_pos);
+					putbit(0); putbit(1); putbit(0); putval(0, 10);
+				}
+				else
+				{
+					// append
+					set_write_pos(raw_block_write_pos);
+					dest_pos--; // overwrite previous null terminator
+				}
+
+				// write raw data (not aligned)
+				int k = 0;
+				for (k = 0; k < raw_size; k++)
+					putval(in[raw_pos_src + k], 8);
+				putval(0,8); // null terminator
+
+				stored_last_segment_as_raw = 1;
+				RESTORE_VLIST_STATE();
+			}
+			else{
+				// leave as-is; reset start position of next possible raw block
+				stored_last_segment_as_raw = 0;
+				raw_pos_src0 = pos;
+				BACKUP_VLIST_STATE();
+			}
+
+			raw_pos_dest = dest_pos;
+			raw_pos_src = pos;
+			raw_block_write_pos = get_write_pos();
+		}
+
 	}
 
 	codo_free(modified_code);
 
-	int bytes_written = (bit == 0x1 ? dest_pos : dest_pos + 1);
+	// advance to next byte (and zero any junk)
+	while (bit != 1)
+		putbit(0); 
+
+	int bytes_written = dest_pos;
 	
 	dest_buf[6] = bytes_written / 256;
 	dest_buf[7] = bytes_written % 256;
+
+
+	// 0.2.0e: compressed is larger than input -> just return input (same as pxc)
+	// for storing binary data -- perhaps cart is mostly data w/ tiny stub
+	// otherwise, storing binary string compresses to around 1.25 (see /pxa/gen_rnd.p8)
+	if (bytes_written > len)
+	{
+		// 0.2.0j: fixed: was in (which now points to deallocated memory. discovered because oversized-cart get_cart_hash was failing!)
+		// would also cause small, or data-heavy .png file save/load to fail
+		memcpy(out, in_p, len); 
+		return len;
+	}
 
 	return bytes_written;
 }
@@ -627,19 +738,33 @@ int pxa_decompress(uint8 *in_p, uint8 *out_p, int max_len)
 			// block
 
 			int block_offset = getnum() + 1;
-			int block_len = getchain(BLOCK_LEN_CHAIN_BITS, 100000) + PXA_MIN_BLOCK_LEN;
 
-			// copy // don't just memcpy because might be copying self for repeating pattern
-			while (block_len > 0){
-				out_p[dest_pos] = out_p[dest_pos - block_offset];
-				dest_pos++;
-				block_len--;
+			if (block_offset == 0)
+			{
+				// 0.2.0j: raw block
+				while (dest_pos < raw_len)
+				{
+					out_p[dest_pos] = getval(8);
+					if (out_p[dest_pos] == 0) // found end -- don't advance dest_pos
+						break;
+					dest_pos ++;
+				}
 			}
+			else
+			{
+				int block_len = getchain(BLOCK_LEN_CHAIN_BITS, 100000) + PXA_MIN_BLOCK_LEN;
 
-			// safety: null terminator. to do: just do at end
-			if (dest_pos < max_len-1)
-				out_p[dest_pos] = 0;
+				// copy // don't just memcpy because might be copying self for repeating pattern
+				while (block_len > 0){
+					out_p[dest_pos] = out_p[dest_pos - block_offset];
+					dest_pos++;
+					block_len--;
+				}
 
+				// safety: null terminator. to do: just do at end
+				if (dest_pos < max_len-1)
+					out_p[dest_pos] = 0;
+			}
 		}else
 		{
 			// literal
@@ -666,7 +791,8 @@ int pxa_decompress(uint8 *in_p, uint8 *out_p, int max_len)
 			dest_pos++;
 			out_p[dest_pos] = 0;
 			
-			for (int i = lpos; i > 0; i--)
+			int i;
+			for (i = lpos; i > 0; i--)
 			{
 				literal[i] = literal[i-1];
 				literal_pos[literal[i]] ++;
@@ -687,15 +813,15 @@ int is_compressed_format_header(uint8 *dat)
 	return 0;
 }
 
-
+// max_len should be 0x10000 (64k max code size)
+// out_p should allocate 0x10001 (includes null terminator)
 int pico8_code_section_decompress(uint8 *in_p, uint8 *out_p, int max_len)
 {
-	//if (is_compressed_format_header(in_p) == 1) return pxc_decompress_mini(in_p, out_p, max_len);
-	if (is_compressed_format_header(in_p) == 2) return pxa_decompress     (in_p, out_p, max_len);
+	if (is_compressed_format_header(in_p) == 0) { memcpy(out_p, in_p, 0x3d00); out_p[0x3d00] = '\0'; return 0; } // legacy: no header -> is raw text
+	if (is_compressed_format_header(in_p) == 1) return decompress_mini(in_p, out_p, max_len);
+	if (is_compressed_format_header(in_p) == 2) return pxa_decompress (in_p, out_p, max_len);
 	return 0;
 }
-
-
 
 
 
